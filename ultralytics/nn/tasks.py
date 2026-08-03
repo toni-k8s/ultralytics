@@ -46,6 +46,7 @@ from ultralytics.nn.modules import (
     Conv,
     Conv2,
     ConvTranspose,
+    Depth,
     Detect,
     DWConv,
     DWConvTranspose2d,
@@ -90,6 +91,7 @@ from ultralytics.utils import (
 )
 from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
+    DepthLoss26,
     E2ELoss,
     PoseLoss26,
     SemanticSegmentationLoss,
@@ -101,7 +103,6 @@ from ultralytics.utils.loss import (
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
-from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (
     fuse_conv_and_bn,
     fuse_deconv_and_bn,
@@ -156,13 +157,12 @@ class BaseModel(torch.nn.Module):
             return self.loss(x, *args, **kwargs)
         return self.predict(x, *args, **kwargs)
 
-    def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
+    def predict(self, x, profile=False, augment=False, embed=None):
         """Perform a forward pass through the network.
 
         Args:
             x (torch.Tensor): The input tensor to the model.
             profile (bool): Print the computation time of each layer if True.
-            visualize (bool): Save the feature maps of the model if True.
             augment (bool): Augment image during prediction.
             embed (list, optional): A list of layer indices to return embeddings from.
 
@@ -171,15 +171,14 @@ class BaseModel(torch.nn.Module):
         """
         if augment:
             return self._predict_augment(x)
-        return self._predict_once(x, profile, visualize, embed)
+        return self._predict_once(x, profile, embed)
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    def _predict_once(self, x, profile=False, embed=None):
         """Perform a forward pass through the network.
 
         Args:
             x (torch.Tensor): The input tensor to the model.
             profile (bool): Print the computation time of each layer if True.
-            visualize (bool): Save the feature maps of the model if True.
             embed (list, optional): A list of layer indices to return embeddings from.
 
         Returns:
@@ -195,8 +194,6 @@ class BaseModel(torch.nn.Module):
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
             if m.i in embed:
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
@@ -707,7 +704,28 @@ class PoseModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
-        return E2ELoss(self, PoseLoss26) if getattr(self, "end2end", False) else v8PoseLoss(self)
+        loss = PoseLoss26 if isinstance(self.model[-1], Pose26) else v8PoseLoss
+        return E2ELoss(self, loss) if self.end2end else loss(self)
+
+
+class DepthModel(DetectionModel):
+    """YOLO depth estimation model.
+
+    This class extends DetectionModel for monocular depth estimation, using YOLO backbone + FPN with a DPT-style dense
+    depth decoder head. Follows the Depth Anything approach adapted to YOLO architecture.
+
+    Examples:
+        >>> model = DepthModel("yolo26n-depth.yaml", ch=3)
+        >>> results = model(image_tensor)
+    """
+
+    def __init__(self, cfg="yolo26n-depth.yaml", ch=3, nc=None, verbose=True):
+        """Initialize YOLO Depth model."""
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the depth loss criterion."""
+        return DepthLoss26(self)
 
 
 class ClassificationModel(BaseModel):
@@ -903,13 +921,12 @@ class RTDETRDetectionModel(DetectionModel):
             [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=img.device
         )
 
-    def predict(self, x, profile=False, visualize=False, batch=None, augment=False, embed=None):
+    def predict(self, x, profile=False, batch=None, augment=False, embed=None):
         """Perform a forward pass through the model.
 
         Args:
             x (torch.Tensor): The input tensor.
             profile (bool): If True, profile the computation time for each layer.
-            visualize (bool): If True, save feature maps for visualization.
             batch (dict, optional): Ground truth data for evaluation.
             augment (bool): If True, perform data augmentation during inference.
             embed (list, optional): A list of layer indices to return embeddings from.
@@ -927,8 +944,6 @@ class RTDETRDetectionModel(DetectionModel):
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
             if m.i in embed:
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
@@ -1009,13 +1024,12 @@ class WorldModel(DetectionModel):
         txt_feats = txt_feats[0] if len(txt_feats) == 1 else torch.cat(txt_feats, dim=0)
         return txt_feats.reshape(-1, len(text), txt_feats.shape[-1])
 
-    def predict(self, x, profile=False, visualize=False, txt_feats=None, augment=False, embed=None):
+    def predict(self, x, profile=False, txt_feats=None, augment=False, embed=None):
         """Perform a forward pass through the model.
 
         Args:
             x (torch.Tensor): The input tensor.
             profile (bool): If True, profile the computation time for each layer.
-            visualize (bool): If True, save feature maps for visualization.
             txt_feats (torch.Tensor, optional): The text features, use it if it's given.
             augment (bool): If True, perform data augmentation during inference.
             embed (list, optional): A list of layer indices to return embeddings from.
@@ -1045,8 +1059,6 @@ class WorldModel(DetectionModel):
                 x = m(x)  # run
 
             y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
             if m.i in embed:
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
@@ -1248,15 +1260,12 @@ class YOLOEModel(DetectionModel):
             all_pe.append(getattr(self, "pe", torch.zeros(1, 80, 512)))
         return torch.cat(all_pe, dim=1)
 
-    def predict(
-        self, x, profile=False, visualize=False, tpe=None, augment=False, embed=None, vpe=None, return_vpe=False
-    ):
+    def predict(self, x, profile=False, tpe=None, augment=False, embed=None, vpe=None, return_vpe=False):
         """Perform a forward pass through the model.
 
         Args:
             x (torch.Tensor): The input tensor.
             profile (bool): If True, profile the computation time for each layer.
-            visualize (bool): If True, save feature maps for visualization.
             tpe (torch.Tensor, optional): Text positional embeddings.
             augment (bool): If True, perform data augmentation during inference.
             embed (list, optional): A list of layer indices to return embeddings from.
@@ -1288,8 +1297,6 @@ class YOLOEModel(DetectionModel):
             x = m(x)  # run
 
             y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
             if m.i in embed:
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
@@ -1392,20 +1399,19 @@ class Ensemble(torch.nn.ModuleList):
         """Initialize an ensemble of models."""
         super().__init__()
 
-    def forward(self, x, augment=False, profile=False, visualize=False):
+    def forward(self, x, augment=False, profile=False):
         """Run ensemble forward pass and concatenate predictions from all models.
 
         Args:
             x (torch.Tensor): Input tensor.
             augment (bool): Whether to augment the input.
             profile (bool): Whether to profile the model.
-            visualize (bool): Whether to visualize the features.
 
         Returns:
             (torch.Tensor): Concatenated predictions from all models.
             (None): Always None for ensemble inference.
         """
-        y = [module(x, augment, profile, visualize)[0] for module in self]
+        y = [module(x, augment, profile)[0] for module in self]
         # y = torch.stack(y).max(0)[0]  # max ensemble
         # y = torch.stack(y).mean(0)  # mean ensemble
         y = torch.cat(y, 2)  # nms ensemble, y shape(B, HW, C*num_models)
@@ -1653,10 +1659,32 @@ def torch_safe_load(weight, safe_only=None):
                     return torch_load(file, map_location="cpu", weights_only=True)
             return torch_load(file, map_location="cpu")
 
+    # weights_only=True raises on a TorchScript archive; the default path returns a ScriptModule instead.
+    torchscript_error = emojis(
+        f"ERROR ❌️ {weight} is a TorchScript archive, not an Ultralytics PyTorch checkpoint.\n"
+        f"Load the original .pt weights, or export again with format='torchscript' and load that file directly."
+    )
+
     try:
         ckpt = _load()
 
-    except RuntimeError as e:
+    except (RuntimeError, EOFError, pickle.UnpicklingError) as e:
+        # An unreadable file reaches the loader as one of three internal errors depending on how it is damaged:
+        # RuntimeError for a truncated zip, EOFError for an empty one, UnpicklingError for bytes that are not a
+        # pickle at all (an image or archive renamed .pt). They are one user-facing condition, so they share one
+        # handler and one message.
+        if isinstance(e, RuntimeError) and "TorchScript archive" in str(e):
+            raise TypeError(torchscript_error) from e
+        if isinstance(e, RuntimeError) and "PytorchStreamReader" not in str(e):
+            raise  # an unrelated RuntimeError is a real failure, not a damaged file
+        if safe_only and isinstance(e, pickle.UnpicklingError):
+            # weights_only=True refused a global outside the allow-list: a format problem, not a damaged file
+            raise TypeError(
+                emojis(
+                    f"ERROR ❌️ {weight} references types outside the supported Ultralytics checkpoint format. "
+                    f"Use an official Ultralytics model, i.e. 'yolo predict model=yolo26n.pt'"
+                )
+            ) from e
         # Recover only a corrupt cached official asset requested by bare name; never touch user-supplied paths.
         name = Path(str(weight)).name
         if "PytorchStreamReader" not in str(e) or str(weight) != name or name not in GITHUB_ASSETS_NAMES:
@@ -1704,17 +1732,8 @@ def torch_safe_load(weight, safe_only=None):
         check_requirements(e.name)  # install missing module
         ckpt = torch_load(file, map_location="cpu")
 
-    except pickle.UnpicklingError as e:
-        # weights_only=True encountered a global outside the allow-list. The default (weights_only=False) path can also
-        # raise this for a corrupt or legacy file, so re-raise verbatim there to preserve existing behavior.
-        if not safe_only:
-            raise
-        raise TypeError(
-            emojis(
-                f"ERROR ❌️ {weight} references types outside the supported Ultralytics checkpoint format. "
-                f"Use an official Ultralytics model, i.e. 'yolo predict model=yolo26n.pt'"
-            )
-        ) from e
+    if isinstance(ckpt, torch.jit.ScriptModule):
+        raise TypeError(torchscript_error)  # default path: torch.load dispatched to torch.jit.load and succeeded
 
     if not isinstance(ckpt, dict):
         # File is likely a YOLO instance saved with i.e. torch.save(model, "saved_model.pt")
@@ -1943,6 +1962,8 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
+        elif m is Depth:
+            args = [*args[:1], [ch[x] for x in f]]  # c_mid, ch tuple; drops the legacy mode arg old checkpoints store
         elif m is SemanticSegment:
             args.append([ch[x] for x in f])  # nc, ch tuple
         elif m is v10Detect:
@@ -2040,7 +2061,7 @@ def guess_model_task(model):
         model (torch.nn.Module | dict | str | Path): PyTorch model, model configuration dict, or model file path.
 
     Returns:
-        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'obb', 'semantic').
+        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'obb', 'semantic', 'depth').
     """
 
     def cfg2task(cfg):
@@ -2058,6 +2079,8 @@ def guess_model_task(model):
             return "pose"
         if "obb" in m:
             return "obb"
+        if "depth" in m:
+            return "depth"
 
     # Guess from model cfg
     if isinstance(model, dict):
@@ -2082,6 +2105,8 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
+            elif isinstance(m, Depth):
+                return "depth"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 
@@ -2098,6 +2123,8 @@ def guess_model_task(model):
             return "pose"
         elif "-obb" in model.stem or "obb" in model.parts:
             return "obb"
+        elif "-depth" in model.stem or "depth" in model.parts:
+            return "depth"
         elif "detect" in model.parts:
             return "detect"
 
